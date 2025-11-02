@@ -171,7 +171,7 @@
                     ❓ 需要幫助？點此查看 Firebase 設定說明
                 </button>
                 <div class="text-gray-500 text-sm">
-                    Made with ❤️ by <a href="https://kentxchang.blogspot.tw" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:text-blue-700 font-semibold underline">阿剛老師 V2.5</a>
+                    Made with ❤️ by <a href="https://kentxchang.blogspot.tw" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:text-blue-700 font-semibold underline">阿剛老師</a>
                 </div>
             </div>
         </div>
@@ -194,6 +194,9 @@
         <!-- Floating Toolbar -->
         <div id="toolbar" class="toolbar fixed bottom-4 left-1/2 -translate-x-1/2 bg-gray-800 bg-opacity-90 backdrop-blur-sm text-white p-2 rounded-xl shadow-lg flex flex-nowrap items-center space-x-1 z-20">
             <!-- Basic Tools -->
+            <button class="tool-btn p-3 rounded-lg hover:bg-gray-700" data-tool="pan" title="移動畫布 (H)">
+                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11V6l-5 5 5 5v-5h6v5l5-5-5-5v5H9z"/></svg>
+            </button>
             <button class="tool-btn p-3 rounded-lg hover:bg-gray-700" data-tool="select" title="選取/移動 (V)">
                 <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z"/><path d="M13 13l6 6"/></svg>
             </button>
@@ -524,8 +527,14 @@ service cloud.firestore {
         let showAuthorNames = false;
         const participantDataMap = new Map(); // Map<uid, {name, role, isLockedByTeacher}>
         let isDrawing = false, isPanning = false, lastPointer = { x: 0, y: 0 };
+        let touchStartTime = 0; // Track when first touch started
+        let initialTouchCount = 0; // Track initial touch count
         let remoteUpdateGuard = false; // Prevent feedback loops
         const fabricObjects = new Map(); // Maps Firestore docId to Fabric object
+
+        // Inactivity timer for students (30 minutes)
+        let inactivityTimer = null;
+        const INACTIVITY_TIMEOUT = 30 * 60 * 1000; // 30 minutes in milliseconds
 
         // --- Firebase Initialization ---
         // ▼▼▼ 請在此處貼上您的 Firebase 設定碼 ▼▼▼
@@ -915,6 +924,7 @@ service cloud.firestore {
 
         function switchPage(pageNum) {
             if (pageNum === currentPage) return;
+            resetInactivityTimer(); // Reset timer on user activity
             currentPage = pageNum;
             console.log(`Switched to page ${currentPage}`);
             listenToPageObjects(pageNum);
@@ -1212,7 +1222,7 @@ service cloud.firestore {
                 backgroundColor: '#f8fafc', // gray-50
                 enableRetinaScaling: true,
                 allowTouchScrolling: true, // Changed to true to support iPad drawing
-                selection: false, // Disable multi-select box
+                selection: true, // Enable multi-select box for select mode (default)
                 isDrawingMode: false
             });
 
@@ -1260,6 +1270,7 @@ service cloud.firestore {
             
             // Pan and Zoom
             canvas.on('mouse:wheel', function(opt) {
+                resetInactivityTimer(); // Reset timer on user activity
                 const delta = opt.e.deltaY;
                 let zoom = canvas.getZoom();
                 zoom *= 0.999 ** delta;
@@ -1273,18 +1284,38 @@ service cloud.firestore {
 
             canvas.on('mouse:down', function(opt) {
                 const evt = opt.e;
+                resetInactivityTimer(); // Reset timer on user activity
 
-                // Check for two-finger touch gesture FIRST (iPad pinch/zoom)
-                if (evt.touches && evt.touches.length === 2) {
-                    isPanning = true;
-                    this.lastDist = Math.hypot(evt.touches[0].clientX - evt.touches[1].clientX, evt.touches[0].clientY - evt.touches[1].clientY);
-                    lastPointer = {
-                        x: (evt.touches[0].clientX + evt.touches[1].clientX) / 2,
-                        y: (evt.touches[0].clientY + evt.touches[1].clientY) / 2
-                    };
-                    canvas.selection = false;
-                    evt.preventDefault();
-                    return;
+                // Track touch events for improved two-finger detection
+                if (evt.touches) {
+                    const currentTime = Date.now();
+                    const touchCount = evt.touches.length;
+
+                    // Reset tracking if it's been too long since last touch (>300ms)
+                    if (currentTime - touchStartTime > 300) {
+                        initialTouchCount = 0;
+                        touchStartTime = 0;
+                    }
+
+                    // Check for two-finger touch gesture
+                    if (touchCount === 2) {
+                        isPanning = true;
+                        this.lastDist = Math.hypot(evt.touches[0].clientX - evt.touches[1].clientX, evt.touches[0].clientY - evt.touches[1].clientY);
+                        lastPointer = {
+                            x: (evt.touches[0].clientX + evt.touches[1].clientX) / 2,
+                            y: (evt.touches[0].clientY + evt.touches[1].clientY) / 2
+                        };
+                        canvas.selection = false;
+                        evt.preventDefault();
+                        console.log('[Touch] 雙指縮放模式已啟動');
+                        return;
+                    }
+
+                    // Track first touch timing
+                    if (touchCount === 1 && initialTouchCount === 0) {
+                        initialTouchCount = 1;
+                        touchStartTime = currentTime;
+                    }
                 }
 
                 // IMPORTANT: If in drawing mode (pen tool), let Fabric.js handle it natively
@@ -1294,17 +1325,32 @@ service cloud.firestore {
                     return;
                 }
 
-                // Pan with Alt key or Right-click (but not on touch)
-                if (!evt.touches && (evt.altKey === true || opt.button === 2)) {
+                // Pan mode: if pan tool is active OR Alt key/Right-click (but not for touch)
+                if (activeTool === 'pan' && evt.touches && evt.touches.length === 1) {
+                    // Pan mode with single touch
+                    isPanning = true;
+                    lastPointer = { x: evt.touches[0].clientX, y: evt.touches[0].clientY };
+                    canvas.selection = false;
+                    this.setCursor('grabbing');
+                    return;
+                } else if (activeTool === 'pan' && !evt.touches) {
+                    // Pan mode with mouse
                     isPanning = true;
                     lastPointer = { x: evt.clientX, y: evt.clientY };
-                    canvas.selection = false; // Temporarily disable group select for panning
+                    canvas.selection = false;
+                    this.setCursor('grabbing');
+                    return;
+                } else if (!evt.touches && (evt.altKey === true || opt.button === 2)) {
+                    // Alt key or Right-click pan (mouse only)
+                    isPanning = true;
+                    lastPointer = { x: evt.clientX, y: evt.clientY };
+                    canvas.selection = false;
                     this.setCursor('grabbing');
                     return;
                 }
 
-                // For shape drawing tools (rect, circle) - not select mode and not pen mode
-                if (activeTool !== 'select' && !canvas.isDrawingMode) {
+                // For shape drawing tools (rect, circle) - not select/pan mode and not pen mode
+                if (activeTool !== 'select' && activeTool !== 'pan' && !canvas.isDrawingMode) {
                     startDrawing(opt);
                 }
                 // Note: When activeTool is 'select' and the user clicks/taps,
@@ -1312,9 +1358,30 @@ service cloud.firestore {
             });
 
             canvas.on('mouse:move', function(opt) {
+                const e = opt.e;
+                resetInactivityTimer(); // Reset timer on user activity
+
+                // Detect if second finger joins during move (improved iPad support)
+                if (e.touches && e.touches.length === 2 && !isPanning && initialTouchCount === 1) {
+                    const currentTime = Date.now();
+                    // If within 300ms of first touch, activate pinch zoom
+                    if (touchStartTime > 0 && currentTime - touchStartTime < 300) {
+                        isPanning = true;
+                        this.lastDist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+                        lastPointer = {
+                            x: (e.touches[0].clientX + e.touches[1].clientX) / 2,
+                            y: (e.touches[0].clientY + e.touches[1].clientY) / 2
+                        };
+                        canvas.selection = false;
+                        canvas.discardActiveObject();
+                        canvas.requestRenderAll();
+                        console.log('[Touch] 雙指縮放模式已啟動 (移動時偵測)');
+                        return;
+                    }
+                }
+
                 // Handle panning gestures
                 if (isPanning) {
-                    const e = opt.e;
                     if (e.touches && e.touches.length === 2) { // Touch gesture move
                         const newDist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
                         const newPointer = {
@@ -1338,6 +1405,12 @@ service cloud.firestore {
 
                         this.lastDist = newDist;
                         lastPointer = newPointer;
+                    } else if (e.touches && e.touches.length === 1) { // Single touch pan move
+                        const vpt = canvas.viewportTransform;
+                        vpt[4] += e.touches[0].clientX - lastPointer.x;
+                        vpt[5] += e.touches[0].clientY - lastPointer.y;
+                        canvas.requestRenderAll();
+                        lastPointer = { x: e.touches[0].clientX, y: e.touches[0].clientY };
                     } else if (!e.touches) { // Mouse pan move
                         const vpt = canvas.viewportTransform;
                         vpt[4] += e.clientX - lastPointer.x;
@@ -1358,7 +1431,24 @@ service cloud.firestore {
             });
 
             canvas.on('mouse:up', function(opt) {
-                isPanning = false;
+                const wasPanning = isPanning;
+
+                // Reset touch tracking based on remaining touches
+                const evt = opt.e;
+                if (!evt.touches || evt.touches.length === 0) {
+                    // All fingers lifted - reset everything
+                    isPanning = false;
+                    touchStartTime = 0;
+                    initialTouchCount = 0;
+                } else if (evt.touches.length === 1) {
+                    // One finger remains - reset for potential new gesture
+                    isPanning = false;
+                    touchStartTime = Date.now();
+                    initialTouchCount = 1;
+                } else {
+                    // Still 2+ fingers - keep panning
+                    isPanning = true;
+                }
 
                 // If in drawing mode (pen tool), let Fabric.js handle it
                 // The path:created event will fire automatically when drawing is complete
@@ -1374,16 +1464,25 @@ service cloud.firestore {
                     canvas.discardActiveObject();
                     canvas.requestRenderAll();
                 }
-                
+
                 // Only enable group selection if the tool is 'select'
                 canvas.selection = (activeTool === 'select');
+                console.log(`[mouse:up] Set canvas.selection = ${canvas.selection}, activeTool = ${activeTool}`);
 
                 // Reset cursor to default for the active tool
-                this.setCursor(activeTool === 'select' ? 'default' : 'crosshair');
+                if (activeTool === 'pan') {
+                    this.setCursor('grab');
+                } else if (activeTool === 'select') {
+                    this.setCursor('default');
+                } else {
+                    this.setCursor('crosshair');
+                }
             });
 
             // Object modification listener (fired when user finishes modifying an object)
             canvas.on('object:modified', async function(e) {
+                resetInactivityTimer(); // Reset timer on user activity
+
                 if (remoteUpdateGuard || !e.target) {
                     console.log('[object:modified] Skipped - remoteUpdateGuard');
                     return;
@@ -1396,12 +1495,14 @@ service cloud.firestore {
                     const objects = updatedObject.getObjects();
                     console.log(`📦 [object:modified] Multi-select modified: ${objects.length} objects`);
 
-                    // Calculate absolute positions for each object in the group
-                    // Use the group's transformation to convert relative to absolute coordinates
-                    const groupMatrix = updatedObject.calcTransformMatrix();
+                    // Temporarily discard the active selection to get absolute coordinates
+                    // This converts relative group coordinates to absolute canvas coordinates
+                    canvas.discardActiveObject();
+                    canvas.requestRenderAll();
 
-                    console.log(`📦 [object:modified] Group transform matrix calculated`);
+                    console.log(`📦 [object:modified] Active selection discarded, objects now have absolute coords`);
 
+                    // Now process each object with their updated absolute coordinates
                     for (const innerObj of objects) {
                         if (!innerObj.docId) {
                             console.warn(`[object:modified] Skipping object without docId`);
@@ -1420,31 +1521,19 @@ service cloud.firestore {
                             }
                         }
 
-                        // Get the object's absolute position using the group's transformation
-                        // This calculates where the object actually is on the canvas
-                        const objectCenter = innerObj.getCenterPoint();
-                        const groupPoint = fabric.util.transformPoint(objectCenter, groupMatrix);
-
-                        // Calculate absolute coordinates
-                        const absoluteLeft = groupPoint.x - (innerObj.width * innerObj.scaleX) / 2;
-                        const absoluteTop = groupPoint.y - (innerObj.height * innerObj.scaleY) / 2;
-
-                        console.log(`📤 [object:modified] Calculated ABSOLUTE position for object:`, {
+                        // After discarding the selection, objects now have absolute coordinates
+                        console.log(`📤 [object:modified] Object absolute position:`, {
                             docId: innerObj.docId,
                             type: innerObj.type,
-                            relativeCenterInGroup: `(${objectCenter.x?.toFixed(0)}, ${objectCenter.y?.toFixed(0)})`,
-                            absoluteCenter: `(${groupPoint.x?.toFixed(0)}, ${groupPoint.y?.toFixed(0)})`,
-                            absolutePosition: `(${absoluteLeft?.toFixed(0)}, ${absoluteTop?.toFixed(0)})`,
+                            position: `(${innerObj.left?.toFixed(0)}, ${innerObj.top?.toFixed(0)})`,
                             scale: `(${innerObj.scaleX?.toFixed(2)}, ${innerObj.scaleY?.toFixed(2)})`,
                             angle: innerObj.angle?.toFixed(0)
                         });
 
                         const objectRef = doc(db, "sessions", sessionId, "canvasObjects", innerObj.docId);
                         try {
-                            // Get object data but override position with absolute coordinates
+                            // Get object data with absolute coordinates
                             const objData = innerObj.toObject();
-                            objData.left = absoluteLeft;
-                            objData.top = absoluteTop;
 
                             if (innerObj.type === 'path' && Array.isArray(objData.path)) {
                                 objData.path = JSON.stringify(objData.path);
@@ -1462,7 +1551,16 @@ service cloud.firestore {
                         }
                     }
 
-                    // DON'T discard the selection - keep user's selection intact
+                    // Re-select the objects to restore the selection
+                    if (objects.length > 0) {
+                        const selection = new fabric.ActiveSelection(objects, {
+                            canvas: canvas
+                        });
+                        canvas.setActiveObject(selection);
+                        canvas.requestRenderAll();
+                        console.log(`📦 [object:modified] Re-selected ${objects.length} objects`);
+                    }
+
                     return;
                 }
 
@@ -1706,32 +1804,21 @@ service cloud.firestore {
                 });
             });
 
-            // IMPORTANT: Prevent multi-selection - only allow single object selection
+            // Multi-selection event handlers - logs selection changes
             canvas.on('selection:created', function(e) {
-                if (e.selected && e.selected.length > 1) {
-                    console.log('🚫 [selection:created] Multi-select blocked - only single selection allowed');
-                    // Keep only the first selected object
-                    const firstObject = e.selected[0];
-                    canvas.discardActiveObject();
-                    canvas.setActiveObject(firstObject);
-                    canvas.requestRenderAll();
-                }
+                resetInactivityTimer(); // Reset timer on user activity
+                console.log(`✅ [selection:created] Selected ${e.selected ? e.selected.length : 0} object(s)`);
             });
 
             canvas.on('selection:updated', function(e) {
-                if (e.selected && e.selected.length > 1) {
-                    console.log('🚫 [selection:updated] Multi-select blocked - only single selection allowed');
-                    // Keep only the first selected object
-                    const firstObject = e.selected[0];
-                    canvas.discardActiveObject();
-                    canvas.setActiveObject(firstObject);
-                    canvas.requestRenderAll();
-                }
+                resetInactivityTimer(); // Reset timer on user activity
+                console.log(`✅ [selection:updated] Selected ${e.selected ? e.selected.length : 0} object(s)`);
             });
 
             // Add listener for the slider UI
             if (zoomSlider) {
                 zoomSlider.addEventListener('input', (e) => {
+                    resetInactivityTimer(); // Reset timer on user activity
                     if (!canvas) return;
                     const zoom = parseFloat(e.target.value);
                     const center = canvas.getCenter();
@@ -1742,12 +1829,47 @@ service cloud.firestore {
 
             updateZoomUI(); // Set initial UI state
             activateTool('select');
+
+            // Start inactivity timer for students
+            if (userRole === 'student') {
+                startInactivityTimer();
+                console.log('[Inactivity] Timer started for student - 30 minutes timeout');
+            }
+        }
+
+        // --- Inactivity Timer Functions (Student Auto-Logout) ---
+        function startInactivityTimer() {
+            // Clear any existing timer
+            if (inactivityTimer) {
+                clearTimeout(inactivityTimer);
+            }
+
+            // Set new timer for 30 minutes
+            inactivityTimer = setTimeout(() => {
+                console.log('[Inactivity] 30 minutes of inactivity detected - logging out student');
+                showMessage('您已經30分鐘沒有操作，系統自動登出。');
+
+                // Wait 2 seconds for message to be visible, then reload
+                setTimeout(() => {
+                    window.location.reload();
+                }, 2000);
+            }, INACTIVITY_TIMEOUT);
+        }
+
+        function resetInactivityTimer() {
+            // Only reset for students
+            if (userRole === 'student' && inactivityTimer) {
+                clearTimeout(inactivityTimer);
+                startInactivityTimer();
+                // Uncomment for debugging: console.log('[Inactivity] Timer reset');
+            }
         }
 
         // --- Toolbar & Tools Logic ---
         const toolButtons = document.querySelectorAll('.tool-btn');
         toolButtons.forEach(btn => {
             btn.addEventListener('click', () => {
+                resetInactivityTimer(); // Reset timer on user activity
                 const tool = btn.dataset.tool;
                 if (tool) activateTool(tool);
             });
@@ -1785,10 +1907,22 @@ service cloud.firestore {
 
             const isDrawingTool = ['pen', 'rect', 'circle'].includes(tool);
             const isSelectMode = tool === 'select';
+            const isPanMode = tool === 'pan';
 
             canvas.isDrawingMode = tool === 'pen';
-            canvas.selection = false; // Always disable multi-select box
-            canvas.defaultCursor = isSelectMode ? 'default' : 'crosshair';
+            // Enable multi-select box only for select mode
+            canvas.selection = isSelectMode;
+
+            console.log(`[activateTool] Set canvas.selection = ${isSelectMode} for tool: ${tool}`);
+
+            // Set cursor based on tool
+            if (isPanMode) {
+                canvas.defaultCursor = 'grab';
+            } else if (isSelectMode) {
+                canvas.defaultCursor = 'default';
+            } else {
+                canvas.defaultCursor = 'crosshair';
+            }
 
             // Discard any active selection when switching tools
             canvas.discardActiveObject();
@@ -1808,27 +1942,32 @@ service cloud.firestore {
             if (isSelectMode && previousTool !== 'select') {
                 console.log(`[activateTool] Switching to select mode - applying additional refreshes`);
 
+                // Ensure selection is enabled
+                canvas.selection = true;
+
                 // Immediate second refresh
                 setTimeout(() => {
                     if (canvas && activeTool === 'select') {
+                        canvas.selection = true;
                         canvas.forEachObject(o => {
                             applyObjectPermissions(o);
                             o.setCoords();
                         });
                         canvas.requestRenderAll();
-                        console.log(`[activateTool] First delayed refresh complete`);
+                        console.log(`[activateTool] First delayed refresh complete, selection = ${canvas.selection}`);
                     }
                 }, 50);
 
                 // Third refresh for good measure (handles async object creation)
                 setTimeout(() => {
                     if (canvas && activeTool === 'select') {
+                        canvas.selection = true;
                         canvas.forEachObject(o => {
                             applyObjectPermissions(o);
                             o.setCoords();
                         });
                         canvas.requestRenderAll();
-                        console.log(`[activateTool] Second delayed refresh complete`);
+                        console.log(`[activateTool] Second delayed refresh complete, selection = ${canvas.selection}`);
                     }
                 }, 150);
             }
@@ -2611,26 +2750,53 @@ service cloud.firestore {
                     // 等待渲染完成
                     await new Promise(resolve => setTimeout(resolve, 200));
 
-                    // 擷取當前可見區域的圖片（高解析度）
-                    const multiplier = 2;
-                    const imgData = canvas.toDataURL({
-                        format: 'png',
-                        quality: 1,
-                        left: viewLeft,
-                        top: viewTop,
-                        width: viewWidth,
-                        height: viewHeight,
-                        multiplier: multiplier
-                    });
+                    // 擷取當前可見區域的圖片（高解析度，帶降級處理）
+                    let imgData = null;
+                    const attempts = [
+                        { multiplier: 2, quality: 1, format: 'png' },      // 最高品質
+                        { multiplier: 1.5, quality: 0.95, format: 'png' }, // 高品質
+                        { multiplier: 1, quality: 0.9, format: 'png' },    // 中品質
+                        { multiplier: 1, quality: 0.85, format: 'jpeg' },  // JPEG 中品質
+                        { multiplier: 0.8, quality: 0.8, format: 'jpeg' }, // JPEG 低品質
+                        { multiplier: 0.5, quality: 0.7, format: 'jpeg' }  // 最低品質
+                    ];
+
+                    for (let i = 0; i < attempts.length; i++) {
+                        try {
+                            const config = attempts[i];
+                            console.log(`[下載PDF] 嘗試配置 ${i + 1}/${attempts.length}: multiplier=${config.multiplier}, quality=${config.quality}, format=${config.format}`);
+
+                            imgData = canvas.toDataURL({
+                                format: config.format,
+                                quality: config.quality,
+                                left: viewLeft,
+                                top: viewTop,
+                                width: viewWidth,
+                                height: viewHeight,
+                                multiplier: config.multiplier
+                            });
+
+                            console.log(`[下載PDF] 第 ${pageNum} 頁圖片生成成功 (配置 ${i + 1})`);
+                            break; // 成功則跳出迴圈
+                        } catch (error) {
+                            console.warn(`[下載PDF] 配置 ${i + 1} 失敗:`, error.message);
+                            if (i === attempts.length - 1) {
+                                // 所有嘗試都失敗
+                                throw new Error(`無法生成第 ${pageNum} 頁的圖片，請嘗試減少畫布內容或縮小可見區域`);
+                            }
+                            // 繼續嘗試下一個配置
+                        }
+                    }
 
                     // 添加到PDF（第一頁不需要addPage）
                     if (pageNum > 1) {
                         pdf.addPage([viewWidth, viewHeight]);
                     }
 
-                    // 將圖片添加到PDF（填滿整頁）
-                    pdf.addImage(imgData, 'PNG', 0, 0, viewWidth, viewHeight);
-                    console.log(`[下載PDF] 第 ${pageNum} 頁已添加 (${viewWidth.toFixed(0)}x${viewHeight.toFixed(0)} px)`);
+                    // 將圖片添加到PDF（填滿整頁，自動檢測格式）
+                    const imageFormat = imgData.startsWith('data:image/jpeg') ? 'JPEG' : 'PNG';
+                    pdf.addImage(imgData, imageFormat, 0, 0, viewWidth, viewHeight);
+                    console.log(`[下載PDF] 第 ${pageNum} 頁已添加 (${viewWidth.toFixed(0)}x${viewHeight.toFixed(0)} px, 格式: ${imageFormat})`);
                 }
 
                 // 恢復作者名稱顯示
@@ -3024,6 +3190,8 @@ service cloud.firestore {
             obj.set({
                 selectable: isSelectable,
                 evented: isSelectable,
+                hasControls: isSelectable,
+                hasBorders: isSelectable,
                 hoverCursor: isSelectable ? 'move' : 'default'
             });
 
@@ -3183,9 +3351,11 @@ service cloud.firestore {
         }
 
         window.addEventListener('keydown', (e) => {
+            resetInactivityTimer(); // Reset timer on user activity
+
             const activeEl = document.activeElement;
             if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.isContentEditable || activeEl.tagName === 'TEXTAREA')) return;
-            
+
             if (e.key.toLowerCase() === 'p' && (e.metaKey || e.ctrlKey)) {
                 e.preventDefault();
             }
@@ -3195,6 +3365,7 @@ service cloud.firestore {
                 case 'p': activateTool('pen'); break;
                 case 'r': activateTool('rect'); break;
                 case 'c': activateTool('circle'); break;
+                case 'h': activateTool('pan'); break;
                 case 'n': activateTool('note'); break;
                 case 'i': document.getElementById('upload-image-btn').click(); break;
                 case 'f': document.getElementById('upload-pdf-btn').click(); break;
